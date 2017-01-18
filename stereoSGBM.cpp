@@ -15,23 +15,6 @@ static void calcPixelCostBT(const Mat& img1, const Mat& img2, int y,
 	PixType *prow1 = buffer + width2 * 2, *prow2 = prow1 + width*cn * 2;
 
 	/*
-	minX1: 128
-	maxX1: 612
-	minX2: 0
-	maxX2: 612
-	D: 128
-
-	int width1 = maxX1 - minX1  ( width1: 484 = maxX1 - minX1 )
-	width2 = maxX2 - minX2; ( width2: 612 = maxX2 - minX2 )
-
-	row1 = right row at y
-	row2 = left  row at y
-	D = 128
-
-	設 params.preFilterCap = 63 則
-	int ftzero = std::max(params.preFilterCap, 15) | 1
-	= 63 (params.preFilterCap = 62或63 ftzero的結果都是63)
-
 	**	查表	  **
 	TAB_OFS = 1024
 	TAB_SIZE = 2304
@@ -255,6 +238,12 @@ static void computeDisparitySGBM(const Mat& img1, const Mat& img2,
 	const int TAB_OFS = 256 * 4, TAB_SIZE = 256 + TAB_OFS * 2;
 	PixType clipTab[TAB_SIZE];
 
+	/************************************************************
+		OpenCV 將 gradient 的值限制在 0 ~ ftzero*2 之間
+		因此如果 gradient score 的值為 0 => 則 tab[0] = ftzero
+		若 gradient 極大,值為255 => tab[255] 最多只到 ftzero * 2
+		若 gradient 極小,值為-255 => tab[-255] 最小只到 0
+	/************************************************************/
 	for (k = 0; k < TAB_SIZE; k++)
 		clipTab[k] = (PixType)(std::min(std::max(k - TAB_OFS, -ftzero), ftzero) + ftzero);
 
@@ -412,31 +401,28 @@ static void computeDisparitySGBM(const Mat& img1, const Mat& img2,
 
 				for (k = dy1; k <= dy2; k++)
 				{
-					/*
-						迴圈功能 (這邊都假設 kernel 大小為 5, SW2 = SH2 = 2)
-							1. 將 row[y+2] 的 pixDiff 算出來
-							2. 計算 row[y+2]的 hsum (horizontal sum, 將 (x-2) (x-1) (x) (x+1) (x+2) 的 pixDiff 累加到 hsumAdd[x]) 
-							3. C[x] = Cprev[x] + hsum[y+2] - hsum[y-3]
-							          Cprev[x] 為 row[y-1] 的 Cost aggregation的結果
-						所以每次跑到 row[y] 的時候, 此for迴圈的輸出結果為 C
-							C 裡面包含了 row[y-2] row[y-1] row[y] row[y+1] row[y+2] 的 Cost 結果
+					/***************************************************
+						在此迴圈中, 會計算 SAD 的 cost (Block Matching), 步驟如下
+						(此處假設 SADWindowSize = 5, SH2 = 2, SW2 = 2)
+						1. 計算第一個 row 中每個pixel 的 pixDiff (calcPixelCostBT)
+						2. 將水平的 pixDiff 累加到 hsum 中
+						(pixDiff * scale => 若上面會左右邊沒有pixel, 則用第一個來補, scale就是控制的權重, 因此對第一個來說scale都是 3 (SW2+1或SH2+1))
+						(hsum[x] = (x-2) ~ (x+2) 的 pixDiff總和 )
+						3. 將 hsum 的值加到 C 中 (透過C來把Cost傳遞一下面的row)
+						C[x] = hsumAdd[x]
+						(現在的 C 在經過後面的 cost aggregation 後, 就會成為下次的 Cprev)
 
-						針對 y = 0
-							1. 計算 row[0] 的 pixDiff
-							2. 計算 hsum[y=0] (累加出來的pixDiff * 3, 直接用第一個row去補上面沒有的兩個row的值)
-							3. C = hsum[y=0] * 3
-							4. C = Cprev + hsum[y=1] - hsum[y=0]
-							5. C = Cprev + hsum[y=2] - hsum[y=0]
-							得到 y = 0 的 C (也就是kernel 5x5 中 25 個 pixDiff的總額)
-							               (當然, 不管x軸還y軸方向, 沒有就用第一個補)
+						4. 計算第二個 row 中每個pixel 的 pixDiff
+						5. 將水平的 pixDiff 累加到 hsum 中
+						6. C[x] = Cprev[x] + hsumAdd - hsumSub
+						(hsumAdd 是 y+2 那個 row 的水平累加結果)
+						(hsumSub 是 y-3 那個 row 的水平累加結果)
+						(加入新的, 減掉最後的, 加快運算速度, 重複利用, 不用每次都重算)
+						之後就是不斷重複這個過程
 
-							//其實中間作法跟 y = 0 做法一樣, 只是不用考慮補值的問題
-							//只要計算 y+2 的 pixDiff 跟 hsum
-							//之後把先前 Cost Aggregation 的結果放到 Cprev
-							//	讓 C = Cprev + hsum[y+2的結果] - hsum[y-3的結果]
-							//	得到新的 Cost
-					*/
-
+						特別需要注意的是 此程式的流程每個 row 都會通過 semi-global cost aggregation
+						因此 Cprev 都是經過 cost aggregation的(這其實也是一條由上往下的cost aggregation路徑)
+					/***************************************************/
 					//除了第一個row以外, 之後做的都是第y+2個row
 					//costBufSize  是 一個 row 的cost buffer size大小 = width1 * D bytes
 					//hsumBufNRows 是 水平kernel size + 1 = 5 + 1 
@@ -810,6 +796,14 @@ static void computeDisparitySGBM(const Mat& img1, const Mat& img2,
 						// do subpixel quadratic interpolation:
 						//   fit parabola into (x1=d-1, y1=Sp[d-1]), (x2=d, y2=Sp[d]), (x3=d+1, y3=Sp[d+1])
 						//   then find minimum of the parabola.
+						/*******************************************************************
+							(Subpixel)
+							用 Cost 當作 y 軸座標 (aggregation後的)
+							用 d    當作 x 軸座標
+							用 (d-1) (d) (d+1) 三個點,使用 parabola fitting,
+							找出該 拋物線真正的 minimum 位置 作為最後 subpixel 的結果
+							可參考 Sub-pixel Estimation of Local Extrema (不過公式有些不同, 目前找不到OpenCV這個版本的算法從哪來的)
+						/*******************************************************************/
 						int denom2 = std::max(Sp[d - 1] + Sp[d + 1] - 2 * Sp[d], 1);
 						d = d*DISP_SCALE + ((Sp[d - 1] - Sp[d + 1])*DISP_SCALE + denom2) / (denom2 * 2);
 					}
